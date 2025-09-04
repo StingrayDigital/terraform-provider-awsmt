@@ -3,10 +3,11 @@ package awsmt
 import (
 	"context"
 	"fmt"
+	"terraform-provider-mediatailor/awsmt/models"
+
 	"github.com/aws/aws-sdk-go-v2/service/mediatailor"
 	awsTypes "github.com/aws/aws-sdk-go-v2/service/mediatailor/types"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	"terraform-provider-mediatailor/awsmt/models"
 )
 
 func getCreateSourceLocationInput(model models.SourceLocationModel) mediatailor.CreateSourceLocationInput {
@@ -122,7 +123,9 @@ func getUpdateSourceLocationInput(model models.SourceLocationModel) mediatailor.
 
 	params.AccessConfiguration = getAccessConfigurationInput(model.AccessConfiguration)
 	// Default Segment Delivery Configuration
-	params.DefaultSegmentDeliveryConfiguration = getDefaultSegmentDeliveryConfigurationInput(model.DefaultSegmentDeliveryConfiguration)
+	if model.DefaultSegmentDeliveryConfiguration != nil {
+		params.DefaultSegmentDeliveryConfiguration = getDefaultSegmentDeliveryConfigurationInput(model.DefaultSegmentDeliveryConfiguration)
+	}
 	// HTTP Configuration
 	params.HttpConfiguration = getHttpConfigurationInput(model.HttpConfiguration)
 
