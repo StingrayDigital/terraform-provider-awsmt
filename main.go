@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
-	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"log"
+	"os"
+	"slices"
+
 	"terraform-provider-mediatailor/awsmt"
+
+	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 )
 
 func main() {
 	err := providerserver.Serve(context.Background(), awsmt.New, providerserver.ServeOpts{
-
-		Address: "registry.terraform.io/spring-media/awsmt",
+		Address: "terraform.stingray.tools/sre/awsmt",
+		Debug:   slices.Contains(os.Args, "-debug"),
 	})
 	if err != nil {
 		log.Fatal(err.Error())
