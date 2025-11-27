@@ -2,18 +2,24 @@ package awsmt
 
 import (
 	"context"
+	"os"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/mediatailor"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	ststypes "github.com/aws/aws-sdk-go-v2/service/sts/types"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-log/tflog"
-	"os"
-	"time"
 )
 
 var (
@@ -30,6 +36,26 @@ type awsmtProviderModel struct {
 	Profile          types.String `tfsdk:"profile"`
 	Region           types.String `tfsdk:"region"`
 	MaxRetryAttempts types.Int64  `tfsdk:"max_retry_attempts"`
+	AssumeRole       types.List   `tfsdk:"assume_role"`
+}
+
+type awsmtProviderModelAssumeRole struct {
+	RoleArn           types.String `tfsdk:"role_arn"`
+	SessionName       types.String `tfsdk:"session_name"`
+	ExternalId        types.String `tfsdk:"external_id"`
+	Tags              types.Map    `tfsdk:"tags"`
+	TransitiveTagKeys types.List   `tfsdk:"transitive_tag_keys"`
+}
+
+type awsClientConfig struct {
+	Region                string
+	Profile               string
+	MaxRetryAttempts      int
+	RoleArn               string
+	RoleSessionName       string
+	RoleExternalId        string
+	RoleTags              map[string]string
+	RoleTransitiveTagKeys []string
 }
 
 func (p *awsmtProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
@@ -38,6 +64,37 @@ func (p *awsmtProvider) Metadata(_ context.Context, _ provider.MetadataRequest, 
 
 func (p *awsmtProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
+		Blocks: map[string]schema.Block{
+			"assume_role": schema.ListNestedBlock{
+				Description: "AWS assume role.",
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"role_arn": schema.StringAttribute{
+							Optional:    true,
+							Description: "Amazon Resource Name (ARN) of an IAM Role to assume prior to making API calls.",
+						},
+						"session_name": schema.StringAttribute{
+							Optional:    true,
+							Description: "An identifier for the assumed role session.",
+						},
+						"external_id": schema.StringAttribute{
+							Optional:    true,
+							Description: "A unique identifier that might be required when you assume a role in another account.",
+						},
+						"tags": schema.MapAttribute{
+							Optional:    true,
+							Description: "Assume role session tags.",
+							ElementType: types.StringType,
+						},
+						"transitive_tag_keys": schema.ListAttribute{
+							Optional:    true,
+							Description: "Assume role session tag keys to pass to any subsequent sessions.",
+							ElementType: types.StringType,
+						},
+					},
+				},
+			},
+		},
 		Attributes: map[string]schema.Attribute{
 			"profile": schema.StringAttribute{
 				Optional:    true,
@@ -65,29 +122,128 @@ func (p *awsmtProvider) Configure(ctx context.Context, req provider.ConfigureReq
 		return
 	}
 
-	var region = "eu-central-1"
-	var profile = ""
-	var maxAttempts = 10
+	assumeBlockList, diags := providerConfig.AssumeRole.ToListValue(ctx)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	var assumeRoleConfig awsmtProviderModelAssumeRole
+	if len(assumeBlockList.Elements()) > 0 {
+		val, err := assumeBlockList.Elements()[0].ToTerraformValue(ctx)
+		if err != nil {
+			resp.Diagnostics.AddError(err.Error(), "Failed to parse something")
+			return
+		}
+
+		mappe := &map[string]tftypes.Value{}
+		err = val.As(&mappe)
+		if err != nil {
+			resp.Diagnostics.AddError(err.Error(), "Failed to parse something")
+			return
+		}
+
+		// Convert map to assumeRoleConfig struct
+		if roleArnVal, ok := (*mappe)["role_arn"]; ok && !roleArnVal.IsNull() {
+			var roleArnStr string
+			if err := roleArnVal.As(&roleArnStr); err == nil {
+				assumeRoleConfig.RoleArn = types.StringValue(roleArnStr)
+			}
+		}
+
+		if sessionNameVal, ok := (*mappe)["session_name"]; ok && !sessionNameVal.IsNull() {
+			var sessionNameStr string
+			if err := sessionNameVal.As(&sessionNameStr); err == nil {
+				assumeRoleConfig.SessionName = types.StringValue(sessionNameStr)
+			}
+		}
+
+		if externalIdVal, ok := (*mappe)["external_id"]; ok && !externalIdVal.IsNull() {
+			var externalIdStr string
+			if err := externalIdVal.As(&externalIdStr); err == nil {
+				assumeRoleConfig.ExternalId = types.StringValue(externalIdStr)
+			}
+		}
+
+		if tagsVal, ok := (*mappe)["tags"]; ok && !tagsVal.IsNull() {
+			var tagsMap map[string]tftypes.Value
+			if err := tagsVal.As(&tagsMap); err == nil {
+				tagsStringMap := make(map[string]attr.Value)
+				for k, v := range tagsMap {
+					var tagVal string
+					if err := v.As(&tagVal); err == nil {
+						tagsStringMap[k] = types.StringValue(tagVal)
+					}
+				}
+				assumeRoleConfig.Tags = types.MapValueMust(types.StringType, tagsStringMap)
+			}
+		}
+
+		if transitiveTagKeysVal, ok := (*mappe)["transitive_tag_keys"]; ok && !transitiveTagKeysVal.IsNull() {
+			var tagKeysList []tftypes.Value
+			if err := transitiveTagKeysVal.As(&tagKeysList); err == nil {
+				tagKeysStringList := make([]attr.Value, 0, len(tagKeysList))
+				for _, v := range tagKeysList {
+					var tagKey string
+					if err := v.As(&tagKey); err == nil {
+						tagKeysStringList = append(tagKeysStringList, types.StringValue(tagKey))
+					}
+				}
+				assumeRoleConfig.TransitiveTagKeys = types.ListValueMust(types.StringType, tagKeysStringList)
+			}
+		}
+
+	}
+
+	// Convert Tags from types.Map to map[string]string
+	roleTags := make(map[string]string)
+	if !assumeRoleConfig.Tags.IsNull() && !assumeRoleConfig.Tags.IsUnknown() {
+		elements := assumeRoleConfig.Tags.Elements()
+		for k, v := range elements {
+			roleTags[k] = v.(types.String).ValueString()
+		}
+	}
+
+	// Convert TransitiveTagKeys from types.List to []string
+	var roleTransitiveTagKeys []string
+	if !assumeRoleConfig.TransitiveTagKeys.IsNull() && !assumeRoleConfig.TransitiveTagKeys.IsUnknown() {
+		elements := assumeRoleConfig.TransitiveTagKeys.Elements()
+		for _, elem := range elements {
+			roleTransitiveTagKeys = append(roleTransitiveTagKeys, elem.(types.String).ValueString())
+		}
+	}
+
+	clientCfg := awsClientConfig{
+		Region:                os.Getenv("AWS_REGION"),
+		MaxRetryAttempts:      10,
+		Profile:               providerConfig.Profile.ValueString(),
+		RoleArn:               assumeRoleConfig.RoleArn.ValueString(),
+		RoleSessionName:       assumeRoleConfig.SessionName.ValueString(),
+		RoleExternalId:        assumeRoleConfig.ExternalId.ValueString(),
+		RoleTags:              roleTags,
+		RoleTransitiveTagKeys: roleTransitiveTagKeys,
+	}
 
 	var err error
 	// New sdk version creation
 	var cfg aws.Config
 
 	if !providerConfig.Region.IsUnknown() || !providerConfig.Region.IsNull() {
-		region = providerConfig.Region.ValueString()
+		clientCfg.Region = providerConfig.Region.ValueString()
 	}
 	if providerConfig.Profile.IsUnknown() || providerConfig.Profile.IsNull() || providerConfig.Profile.ValueString() == "" {
 		if os.Getenv("AWS_PROFILE") != "" {
-			profile = os.Getenv("AWS_PROFILE")
+			clientCfg.Profile = os.Getenv("AWS_PROFILE")
 		}
 	} else {
-		profile = providerConfig.Profile.ValueString()
+		clientCfg.Profile = providerConfig.Profile.ValueString()
 	}
 	if !providerConfig.MaxRetryAttempts.IsUnknown() || !providerConfig.MaxRetryAttempts.IsNull() {
-		maxAttempts = int(providerConfig.MaxRetryAttempts.ValueInt64())
+		clientCfg.MaxRetryAttempts = int(providerConfig.MaxRetryAttempts.ValueInt64())
 	}
+
 	tflog.Debug(ctx, "Creating AWS client session")
-	cfg, err = p.getClientConfig(ctx, region, profile, maxAttempts)
+	cfg, err = p.getClientConfig(ctx, clientCfg)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to Initialize Provider in Region", "unable to initialize provider in the specified region: "+err.Error())
 		return
@@ -101,26 +257,56 @@ func (p *awsmtProvider) Configure(ctx context.Context, req provider.ConfigureReq
 	tflog.Info(ctx, "AWS MediaTailor client configured", map[string]any{"success": true})
 }
 
-func (p *awsmtProvider) getClientConfig(ctx context.Context, region, profile string, maxAttempts int) (aws.Config, error) {
+func (p *awsmtProvider) getClientConfig(ctx context.Context, cfg awsClientConfig) (aws.Config, error) {
 	backoff := customBackoff{
 		minDelay: 500 * time.Millisecond,
 	}
 	retryer := retry.NewStandard(func(o *retry.StandardOptions) {
 		o.Backoff = backoff
-		o.MaxAttempts = maxAttempts
+		o.MaxAttempts = cfg.MaxRetryAttempts
 		o.MaxBackoff = 10 * time.Second
 	})
 
+	if cfg.Region == "" {
+		cfg.Region = "us-east-1"
+	}
+
 	var optFns []func(*config.LoadOptions) error
-	optFns = append(optFns, config.WithRegion(region))
+	optFns = append(optFns, config.WithRegion(cfg.Region))
 	optFns = append(optFns, config.WithRetryer(func() aws.Retryer {
 		return retryer
 	}))
-	if profile != "" {
-		optFns = append(optFns, config.WithSharedConfigProfile(profile))
+
+	if cfg.Profile != "" {
+		optFns = append(optFns, config.WithSharedConfigProfile(cfg.Profile))
 	}
 
-	return config.LoadDefaultConfig(ctx, optFns...)
+	awscfg, err := config.LoadDefaultConfig(ctx, optFns...)
+	if err != nil {
+		return aws.Config{}, err
+	}
+
+	if cfg.RoleArn != "" {
+		awscfg.Credentials = stscreds.NewAssumeRoleProvider(sts.NewFromConfig(awscfg), cfg.RoleArn, func(options *stscreds.AssumeRoleOptions) {
+			options.RoleARN = cfg.RoleArn
+			options.RoleSessionName = cfg.RoleSessionName
+			if cfg.RoleExternalId != "" {
+				options.ExternalID = &cfg.RoleExternalId
+			}
+			options.TransitiveTagKeys = cfg.RoleTransitiveTagKeys
+			for k, v := range cfg.RoleTags {
+				options.Tags = append(options.Tags, ststypes.Tag{
+					Key:   aws.String(k),
+					Value: aws.String(v),
+				})
+			}
+		})
+	}
+
+	// wrap through a cache
+	awscfg.Credentials = aws.NewCredentialsCache(awscfg.Credentials)
+
+	return awscfg, nil
 }
 
 func (p *awsmtProvider) DataSources(_ context.Context) []func() datasource.DataSource {

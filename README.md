@@ -1,3 +1,7 @@
+# FORK notes
+
+-> Added assume_role block support to provider configuration
+
 # terraform-provider-awsmt
 
 A Terraform provider for AWS MediaTailor
